@@ -1,0 +1,151 @@
+//@version=6
+indicator("Swing Structure & Fib (Free)", shorttitle="SSF Free", overlay=true, max_labels_count=200, max_lines_count=200, max_boxes_count=100)
+
+// Free edition. Educational tool only. Not financial advice.
+// Swing structure (HH/HL/LH/LL), support/resistance zones, BOS/CHoCH, and Fibonacci on the last main swing.
+
+// ---------------- Inputs ----------------
+gS = "Swings"
+len        = input.int(5, "Pivot length", minval=2, tooltip="Bars on each side used to confirm a swing. Higher = fewer, bigger swings.", group=gS)
+showLabels = input.bool(true, "Structure labels (HH / HL / LH / LL)", group=gS)
+showZones  = input.bool(true, "Support / resistance zones", group=gS)
+maxZones   = input.int(6, "Max zones on chart", minval=1, maxval=40, group=gS)
+zoneLen    = input.int(30, "Zone length (bars)", minval=5, maxval=300, group=gS)
+zoneAtr    = input.float(0.3, "Zone thickness (x ATR)", minval=0.05, step=0.05, group=gS)
+
+gB = "Structure breaks"
+showStruct = input.bool(true, "BOS / CHoCH", tooltip="BOS = break in the trend direction (continuation). CHoCH = break against the trend (possible reversal).", group=gB)
+
+gF = "Fibonacci"
+showFib  = input.bool(true, "Fibonacci on the last main swing", group=gF)
+showGold = input.bool(true, "Golden zone (0.618 - 0.786)", group=gF)
+legMul   = input.float(3.0, "Minimum swing size (x ATR)", minval=1.0, step=0.5, tooltip="Smaller swings are ignored to keep the chart clean.", group=gF)
+
+gC = "Colors"
+bullCol  = input.color(#14B8A6, "Bullish", group=gC)
+bearCol  = input.color(#F43F5E, "Bearish", group=gC)
+goldCol  = input.color(#F5C451, "Fibonacci", group=gC)
+mutedCol = input.color(#94A3B8, "Neutral", group=gC)
+
+// ---------------- State ----------------
+atr = ta.atr(14)
+ph  = ta.pivothigh(high, len, len)
+pl  = ta.pivotlow(low, len, len)
+
+var float lastPH = na
+var float lastPL = na
+var int   lastPHbar = na
+var int   lastPLbar = na
+var int   trend = 0          // 1 = up, -1 = down, 0 = unknown
+var bool  phBroken = true
+var bool  plBroken = true
+
+var array<box>   zoneBoxes = array.new<box>()
+var array<line>  fibLines  = array.new<line>()
+var array<label> fibLabels = array.new<label>()
+var array<box>   fibBoxes  = array.new<box>()
+
+// ---------------- Helpers ----------------
+addZone(float price, float half, int bar0, color col) =>
+    if showZones
+        array.push(zoneBoxes, box.new(bar0, price + half, bar0 + zoneLen, price - half, border_color=color.new(col, 100), bgcolor=color.new(col, 86)))
+        if array.size(zoneBoxes) > maxZones
+            box.delete(array.shift(zoneBoxes))
+    true
+
+buildFib(float sP, float eP, int sBar, int eBar, int dir, bool doGold) =>
+    for l in fibLines
+        line.delete(l)
+    for lb in fibLabels
+        label.delete(lb)
+    for b in fibBoxes
+        box.delete(b)
+    array.clear(fibLines)
+    array.clear(fibLabels)
+    array.clear(fibBoxes)
+
+    float legSize = math.abs(eP - sP)
+    array.push(fibLines, line.new(sBar, sP, eBar, eP, color=color.new(mutedCol, 40), style=line.style_dotted, width=1))
+
+    if doGold
+        float g1p = eP - dir * 0.618 * legSize
+        float g2p = eP - dir * 0.786 * legSize
+        array.push(fibBoxes, box.new(eBar, math.max(g1p, g2p), eBar + 1, math.min(g1p, g2p), extend=extend.right, border_color=color.new(goldCol, 100), bgcolor=color.new(goldCol, 88)))
+
+    for r in array.from(0.382, 0.5, 0.618, 0.786)
+        float p = eP - dir * r * legSize
+        bool key = r >= 0.618
+        array.push(fibLines, line.new(eBar, p, eBar + 1, p, extend=extend.right, color=color.new(goldCol, key ? 15 : 55), width=key ? 2 : 1))
+        array.push(fibLabels, label.new(eBar, p, str.tostring(r) + "  " + str.tostring(p, format.mintick), style=label.style_none, textcolor=color.new(goldCol, key ? 0 : 30), size=size.small))
+    true
+
+// ---------------- Swing HIGH ----------------
+if not na(ph)
+    pbar = bar_index - len
+    a = atr[len]
+    bool isHH = ph > lastPH
+    string kind = na(lastPH) ? "H" : (isHH ? "HH" : "LH")
+    color tcol = na(lastPH) ? mutedCol : (isHH ? bullCol : bearCol)
+    if showLabels
+        label.new(pbar, ph, kind, style=label.style_label_down, color=color.new(tcol, 100), textcolor=tcol, size=size.small)
+    addZone(ph, a * zoneAtr, pbar, bearCol)
+
+    lastPH := ph
+    lastPHbar := pbar
+    phBroken := false
+
+    if showFib and not na(lastPL) and (ph - lastPL) >= legMul * a
+        buildFib(lastPL, ph, lastPLbar, pbar, 1, showGold)
+
+// ---------------- Swing LOW ----------------
+if not na(pl)
+    pbar = bar_index - len
+    a = atr[len]
+    bool isLL = pl < lastPL
+    string kind = na(lastPL) ? "L" : (isLL ? "LL" : "HL")
+    color tcol = na(lastPL) ? mutedCol : (isLL ? bearCol : bullCol)
+    if showLabels
+        label.new(pbar, pl, kind, style=label.style_label_up, color=color.new(tcol, 100), textcolor=tcol, size=size.small)
+    addZone(pl, a * zoneAtr, pbar, bullCol)
+
+    lastPL := pl
+    lastPLbar := pbar
+    plBroken := false
+
+    if showFib and not na(lastPH) and (lastPH - pl) >= legMul * a
+        buildFib(lastPH, pl, lastPHbar, pbar, -1, showGold)
+
+// ---------------- Structure breaks (closed bars only) ----------------
+brkUp = not na(lastPH) and not phBroken and close > lastPH and barstate.isconfirmed
+brkDn = not na(lastPL) and not plBroken and close < lastPL and barstate.isconfirmed
+chochUp = brkUp and trend == -1
+bosUp   = brkUp and trend != -1
+chochDn = brkDn and trend == 1
+bosDn   = brkDn and trend != 1
+
+if brkUp
+    if showStruct
+        midX = math.round((lastPHbar + bar_index) / 2.0)
+        line.new(lastPHbar, lastPH, bar_index, lastPH, color=color.new(bullCol, chochUp ? 0 : 40), style=line.style_dashed, width=chochUp ? 2 : 1)
+        label.new(midX, lastPH, chochUp ? "CHoCH" : "BOS", style=label.style_label_down, color=chochUp ? bullCol : color.new(bullCol, 100), textcolor=chochUp ? color.white : bullCol, size=size.small)
+    phBroken := true
+    trend := 1
+
+if brkDn
+    if showStruct
+        midX = math.round((lastPLbar + bar_index) / 2.0)
+        line.new(lastPLbar, lastPL, bar_index, lastPL, color=color.new(bearCol, chochDn ? 0 : 40), style=line.style_dashed, width=chochDn ? 2 : 1)
+        label.new(midX, lastPL, chochDn ? "CHoCH" : "BOS", style=label.style_label_up, color=chochDn ? bearCol : color.new(bearCol, 100), textcolor=chochDn ? color.white : bearCol, size=size.small)
+    plBroken := true
+    trend := -1
+
+// Keep Fibonacci price labels at the right edge of the chart
+if barstate.islast
+    for lb in fibLabels
+        label.set_x(lb, bar_index + 3)
+
+// ---------------- Alerts ----------------
+alertcondition(chochUp, "CHoCH up (possible reversal up)", "Bullish CHoCH")
+alertcondition(chochDn, "CHoCH down (possible reversal down)", "Bearish CHoCH")
+alertcondition(bosUp, "BOS up (trend continuation)", "Bullish BOS")
+alertcondition(bosDn, "BOS down (trend continuation)", "Bearish BOS")

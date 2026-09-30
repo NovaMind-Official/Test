@@ -1,0 +1,341 @@
+//@version=6
+indicator("Swing Structure & Fib PRO", shorttitle="SSF Pro", overlay=true, max_labels_count=300, max_lines_count=300, max_boxes_count=150)
+
+// PRO edition (private use). Educational tool only. Not financial advice.
+// Scored swings, zones that extend until broken, BOS/CHoCH, Fibonacci with confluence + extensions,
+// higher-timeframe bias, dashboard and alerts.
+
+// ---------------- Inputs ----------------
+gS = "Swings"
+len        = input.int(5, "Pivot length", minval=2, tooltip="Bars on each side used to confirm a swing. Higher = fewer, bigger swings.", group=gS)
+srcMode    = input.string("Wicks", "Swing source", options=["Wicks", "Bodies"], tooltip="Bodies ignores long wicks, so Fibonacci is anchored to real closes/opens.", group=gS)
+showLabels = input.bool(true, "Structure labels (HH / HL / LH / LL + score)", group=gS)
+showZones  = input.bool(true, "Support / resistance zones", group=gS)
+maxZones   = input.int(8, "Max zones on chart", minval=1, maxval=40, group=gS)
+zoneAtr    = input.float(0.3, "Zone thickness (x ATR)", minval=0.05, step=0.05, group=gS)
+minScore   = input.int(1, "Minimum score to display (0-4)", minval=0, maxval=4, group=gS)
+
+gQ = "Scoring (each factor = +1)"
+volMult     = input.float(1.5, "Volume spike (x 20-bar average)", step=0.1, group=gQ)
+rsiHi       = input.int(70, "RSI overbought (for highs)", group=gQ)
+rsiLo       = input.int(30, "RSI oversold (for lows)", group=gQ)
+swingMul    = input.float(2.0, "Big swing (x ATR from last opposite pivot)", step=0.5, group=gQ)
+strongScore = input.int(3, "Highlight swings with score >=", minval=1, maxval=4, group=gQ)
+
+gB = "Structure breaks"
+showStruct = input.bool(true, "BOS / CHoCH", tooltip="BOS = break in the trend direction (continuation). CHoCH = break against the trend (possible reversal).", group=gB)
+
+gF = "Fibonacci"
+showFib  = input.bool(true, "Fibonacci on the last main swing", group=gF)
+showGold = input.bool(true, "Golden zone (0.618 - 0.786)", group=gF)
+showExt  = input.bool(true, "Extensions (1.272 / 1.618)", group=gF)
+legMul   = input.float(3.0, "Minimum swing size (x ATR)", minval=1.0, step=0.5, group=gF)
+fibTol   = input.float(0.25, "Level tolerance (x ATR)", minval=0.05, step=0.05, group=gF)
+confMin  = input.int(2, "Min zone score for confluence (*)", minval=0, maxval=4, tooltip="A Fibonacci level gets a star only if it overlaps a live zone with at least this score.", group=gF)
+
+gD = "Dashboard"
+showTable = input.bool(true, "Show dashboard", group=gD)
+htf       = input.timeframe("240", "Higher timeframe for bias", tooltip="Bias = HTF close above/below its EMA 50 (previous closed HTF bar, no repaint).", group=gD)
+
+gC = "Colors"
+bullCol  = input.color(#00E0A4, "Bullish", group=gC)
+bearCol  = input.color(#FF4D6D, "Bearish", group=gC)
+goldCol  = input.color(#FFC857, "Fibonacci", group=gC)
+extCol   = input.color(#4CC9F0, "Extensions", group=gC)
+mutedCol = input.color(#94A3B8, "Neutral", group=gC)
+
+// ---------------- Calculations ----------------
+atr    = ta.atr(14)
+rsi    = ta.rsi(close, 14)
+volAvg = ta.sma(volume, 20)
+
+hiSrc = srcMode == "Bodies" ? math.max(open, close) : high
+loSrc = srcMode == "Bodies" ? math.min(open, close) : low
+ph = ta.pivothigh(hiSrc, len, len)
+pl = ta.pivotlow(loSrc, len, len)
+
+htfBias = request.security(syminfo.tickerid, htf, close[1] > ta.ema(close, 50)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+
+// ---------------- State ----------------
+var float lastPH = na
+var float lastPL = na
+var int   lastPHbar = na
+var int   lastPLbar = na
+var int   trend = 0          // 1 = up, -1 = down, 0 = unknown
+var bool  phBroken = true
+var bool  plBroken = true
+var array<float> hiLevels = array.new<float>()
+var array<float> loLevels = array.new<float>()
+
+// zones (parallel arrays)
+var array<box>   zBox    = array.new<box>()
+var array<float> zPrice  = array.new<float>()
+var array<float> zTop    = array.new<float>()
+var array<float> zBot    = array.new<float>()
+var array<int>   zScore  = array.new<int>()
+var array<bool>  zRes    = array.new<bool>()
+var array<bool>  zAlive  = array.new<bool>()
+
+// Fibonacci
+var array<line>   fibLines  = array.new<line>()
+var array<label>  fibLabels = array.new<label>()
+var array<box>    fibBoxes  = array.new<box>()
+var array<float>  fibPrices = array.new<float>()
+var array<bool>   fibConf   = array.new<bool>()
+var array<string> fibNames  = array.new<string>()
+var int   fibDir = 0
+var float fibStart = na
+var float fibEnd = na
+
+// ---------------- Helpers ----------------
+addZone(float price, float half, int bar0, bool isRes, int sc) =>
+    color col = isRes ? bearCol : bullCol
+    float top = price + half
+    float bot = price - half
+    array.push(zBox, box.new(bar0, top, bar0 + 1, bot, border_color=color.new(col, 70), border_width=1, bgcolor=color.new(col, 94 - sc * 4)))
+    array.push(zPrice, price)
+    array.push(zTop, top)
+    array.push(zBot, bot)
+    array.push(zScore, sc)
+    array.push(zRes, isRes)
+    array.push(zAlive, true)
+    if array.size(zBox) > maxZones
+        box.delete(array.shift(zBox))
+        array.shift(zPrice)
+        array.shift(zTop)
+        array.shift(zBot)
+        array.shift(zScore)
+        array.shift(zRes)
+        array.shift(zAlive)
+    true
+
+hasConf(float price, float tol) =>
+    bool found = false
+    int n = array.size(zPrice)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(zAlive, i) and array.get(zScore, i) >= confMin and math.abs(array.get(zPrice, i) - price) <= tol
+                found := true
+    found
+
+buildFib(float sP, float eP, int sBar, int eBar, int dir, float tol, bool doGold, bool doExt) =>
+    for l in fibLines
+        line.delete(l)
+    for lb in fibLabels
+        label.delete(lb)
+    for b in fibBoxes
+        box.delete(b)
+    array.clear(fibLines)
+    array.clear(fibLabels)
+    array.clear(fibBoxes)
+    array.clear(fibPrices)
+    array.clear(fibConf)
+    array.clear(fibNames)
+
+    float legSize = math.abs(eP - sP)
+    array.push(fibLines, line.new(sBar, sP, eBar, eP, color=color.new(mutedCol, 40), style=line.style_dotted, width=1))
+
+    if doGold
+        float g1p = eP - dir * 0.618 * legSize
+        float g2p = eP - dir * 0.786 * legSize
+        array.push(fibBoxes, box.new(eBar, math.max(g1p, g2p), eBar + 1, math.min(g1p, g2p), extend=extend.right, border_color=color.new(goldCol, 100), bgcolor=color.new(goldCol, 88)))
+
+    for r in array.from(0.382, 0.5, 0.618, 0.786)
+        float p = eP - dir * r * legSize
+        bool c = hasConf(p, tol)
+        bool key = r >= 0.618
+        string nm = str.tostring(r) + (c ? " ★" : "")
+        array.push(fibLines, line.new(eBar, p, eBar + 1, p, extend=extend.right, color=c ? goldCol : color.new(goldCol, key ? 35 : 65), width=(c or key) ? 2 : 1))
+        array.push(fibLabels, label.new(eBar, p, nm + "  " + str.tostring(p, format.mintick), style=label.style_none, textcolor=c ? goldCol : color.new(goldCol, key ? 15 : 40), size=size.small))
+        array.push(fibPrices, p)
+        array.push(fibConf, c)
+        array.push(fibNames, nm)
+
+    if doExt
+        for r in array.from(1.272, 1.618)
+            float p = eP + dir * (r - 1) * legSize
+            bool c = hasConf(p, tol)
+            string nm = str.tostring(r) + (c ? " ★" : "")
+            array.push(fibLines, line.new(eBar, p, eBar + 1, p, extend=extend.right, color=color.new(extCol, 25), style=line.style_dashed, width=1))
+            array.push(fibLabels, label.new(eBar, p, nm + "  " + str.tostring(p, format.mintick), style=label.style_none, textcolor=extCol, size=size.small))
+            array.push(fibPrices, p)
+            array.push(fibConf, c)
+            array.push(fibNames, nm)
+    true
+
+// ---------------- Swing HIGH ----------------
+if not na(ph)
+    pbar = bar_index - len
+    a = atr[len]
+    w = a * zoneAtr
+    int sc = 0
+    sc += volume[len] > volAvg[len] * volMult ? 1 : 0
+    sc += rsi[len] >= rsiHi ? 1 : 0
+    if not na(lastPL)
+        sc += (ph - lastPL) >= swingMul * a ? 1 : 0
+    int touches = 0
+    for lv in hiLevels
+        touches += math.abs(lv - ph) <= w ? 1 : 0
+    sc += touches > 0 ? 1 : 0
+
+    bool isHH = ph > lastPH
+    string kind = na(lastPH) ? "H" : (isHH ? "HH" : "LH")
+    color tcol = na(lastPH) ? mutedCol : (isHH ? bullCol : bearCol)
+    if showLabels and sc >= minScore
+        bool strong = sc >= strongScore
+        label.new(pbar, ph, kind + " · " + str.tostring(sc), style=label.style_label_down, color=strong ? color.new(tcol, 15) : color.new(tcol, 100), textcolor=strong ? color.white : tcol, size=size.small)
+    if showZones and sc >= minScore
+        addZone(ph, w, pbar, true, sc)
+
+    array.push(hiLevels, ph)
+    if array.size(hiLevels) > 10
+        array.shift(hiLevels)
+    lastPH := ph
+    lastPHbar := pbar
+    phBroken := false
+
+    if showFib and not na(lastPL) and (ph - lastPL) >= legMul * a
+        fibDir := 1
+        fibStart := lastPL
+        fibEnd := ph
+        buildFib(lastPL, ph, lastPLbar, pbar, 1, atr * fibTol, showGold, showExt)
+
+// ---------------- Swing LOW ----------------
+if not na(pl)
+    pbar = bar_index - len
+    a = atr[len]
+    w = a * zoneAtr
+    int sc = 0
+    sc += volume[len] > volAvg[len] * volMult ? 1 : 0
+    sc += rsi[len] <= rsiLo ? 1 : 0
+    if not na(lastPH)
+        sc += (lastPH - pl) >= swingMul * a ? 1 : 0
+    int touches = 0
+    for lv in loLevels
+        touches += math.abs(lv - pl) <= w ? 1 : 0
+    sc += touches > 0 ? 1 : 0
+
+    bool isLL = pl < lastPL
+    string kind = na(lastPL) ? "L" : (isLL ? "LL" : "HL")
+    color tcol = na(lastPL) ? mutedCol : (isLL ? bearCol : bullCol)
+    if showLabels and sc >= minScore
+        bool strong = sc >= strongScore
+        label.new(pbar, pl, kind + " · " + str.tostring(sc), style=label.style_label_up, color=strong ? color.new(tcol, 15) : color.new(tcol, 100), textcolor=strong ? color.white : tcol, size=size.small)
+    if showZones and sc >= minScore
+        addZone(pl, w, pbar, false, sc)
+
+    array.push(loLevels, pl)
+    if array.size(loLevels) > 10
+        array.shift(loLevels)
+    lastPL := pl
+    lastPLbar := pbar
+    plBroken := false
+
+    if showFib and not na(lastPH) and (lastPH - pl) >= legMul * a
+        fibDir := -1
+        fibStart := lastPH
+        fibEnd := pl
+        buildFib(lastPH, pl, lastPHbar, pbar, -1, atr * fibTol, showGold, showExt)
+
+// ---------------- Structure breaks (closed bars only) ----------------
+brkUp = not na(lastPH) and not phBroken and close > lastPH and barstate.isconfirmed
+brkDn = not na(lastPL) and not plBroken and close < lastPL and barstate.isconfirmed
+chochUp = brkUp and trend == -1
+bosUp   = brkUp and trend != -1
+chochDn = brkDn and trend == 1
+bosDn   = brkDn and trend != 1
+
+if brkUp
+    if showStruct
+        midX = math.round((lastPHbar + bar_index) / 2.0)
+        line.new(lastPHbar, lastPH, bar_index, lastPH, color=color.new(bullCol, chochUp ? 0 : 40), style=line.style_dashed, width=chochUp ? 2 : 1)
+        label.new(midX, lastPH, chochUp ? "CHoCH" : "BOS", style=label.style_label_down, color=chochUp ? bullCol : color.new(bullCol, 100), textcolor=chochUp ? color.white : bullCol, size=size.small)
+    phBroken := true
+    trend := 1
+
+if brkDn
+    if showStruct
+        midX = math.round((lastPLbar + bar_index) / 2.0)
+        line.new(lastPLbar, lastPL, bar_index, lastPL, color=color.new(bearCol, chochDn ? 0 : 40), style=line.style_dashed, width=chochDn ? 2 : 1)
+        label.new(midX, lastPL, chochDn ? "CHoCH" : "BOS", style=label.style_label_up, color=chochDn ? bearCol : color.new(bearCol, 100), textcolor=chochDn ? color.white : bearCol, size=size.small)
+    plBroken := true
+    trend := -1
+
+// ---------------- Zones: extend until broken (mitigation) ----------------
+int nz = array.size(zBox)
+if nz > 0
+    for i = 0 to nz - 1
+        if array.get(zAlive, i)
+            box zb = array.get(zBox, i)
+            bool isRes = array.get(zRes, i)
+            box.set_right(zb, bar_index)
+            bool broken = isRes ? close > array.get(zTop, i) : close < array.get(zBot, i)
+            if broken and barstate.isconfirmed
+                array.set(zAlive, i, false)
+                box.set_bgcolor(zb, color.new(isRes ? bearCol : bullCol, 97))
+                box.set_border_color(zb, color.new(isRes ? bearCol : bullCol, 92))
+
+// ---------------- Fibonacci touch detection ----------------
+tolNow = atr * fibTol
+bool touchAny = false
+bool touchConf = false
+nFib = array.size(fibPrices)
+if nFib > 0
+    for j = 0 to nFib - 1
+        pr = array.get(fibPrices, j)
+        if low <= pr + tolNow and high >= pr - tolNow
+            touchAny := true
+            if array.get(fibConf, j)
+                touchConf := true
+
+fibTouch     = touchAny and not touchAny[1] and barstate.isconfirmed
+fibTouchConf = touchConf and not touchConf[1] and barstate.isconfirmed
+
+plotshape(fibTouchConf, "Fib + zone confluence", shape.diamond, location.abovebar, goldCol, size=size.tiny)
+
+// Keep Fibonacci price labels at the right edge of the chart
+if barstate.islast
+    for lb in fibLabels
+        label.set_x(lb, bar_index + 3)
+
+// ---------------- Dashboard ----------------
+var table info = table.new(position.top_right, 2, 5, bgcolor=color.new(#0B1220, 15), border_color=color.new(mutedCol, 60), border_width=1)
+if barstate.islast and showTable
+    color trendCol = trend == 1 ? bullCol : trend == -1 ? bearCol : color.white
+    string trendTxt = trend == 1 ? "Up" : trend == -1 ? "Down" : "-"
+    color htfCol = htfBias == 1 ? bullCol : htfBias == -1 ? bearCol : color.white
+    string htfTxt = htfBias == 1 ? "Bullish" : htfBias == -1 ? "Bearish" : "-"
+    string legTxt = fibDir == 1 ? "Up swing" : fibDir == -1 ? "Down swing" : "-"
+    string nearTxt = "-"
+    float best = na
+    n2 = array.size(fibPrices)
+    if n2 > 0
+        for k = 0 to n2 - 1
+            d = math.abs(close - array.get(fibPrices, k))
+            if na(best) or d < best
+                best := d
+                nearTxt := array.get(fibNames, k)
+    string goldTxt = "-"
+    if not na(fibEnd)
+        legL = math.abs(fibEnd - fibStart)
+        ga = fibEnd - fibDir * 0.618 * legL
+        gb = fibEnd - fibDir * 0.786 * legL
+        goldTxt := (close <= math.max(ga, gb) and close >= math.min(ga, gb)) ? "Yes" : "No"
+    table.cell(info, 0, 0, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, trendTxt, text_color=trendCol, text_size=size.small)
+    table.cell(info, 0, 1, "HTF bias", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, htfTxt, text_color=htfCol, text_size=size.small)
+    table.cell(info, 0, 2, "Fib swing", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, legTxt, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 3, "Nearest level", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 3, nearTxt, text_color=goldCol, text_size=size.small)
+    table.cell(info, 0, 4, "In golden zone", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 4, goldTxt, text_color=goldTxt == "Yes" ? goldCol : color.white, text_size=size.small)
+
+// ---------------- Alerts ----------------
+alertcondition(chochUp, "CHoCH up (possible reversal up)", "Bullish CHoCH")
+alertcondition(chochDn, "CHoCH down (possible reversal down)", "Bearish CHoCH")
+alertcondition(bosUp, "BOS up (trend continuation)", "Bullish BOS")
+alertcondition(bosDn, "BOS down (trend continuation)", "Bearish BOS")
+alertcondition(fibTouch, "Price at Fibonacci level", "Price touched a Fibonacci level")
+alertcondition(fibTouchConf, "Price at Fibonacci level + zone confluence", "Price touched a Fibonacci level that overlaps a live zone")
